@@ -1,0 +1,57 @@
+name: Everything Mac derle
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: Apple-Silikon
+          - os: macos-15-intel
+            name: Intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Araclari kur
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller watchdog
+          python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Uygulamayi derle
+        run: |
+          pyinstaller --noconfirm --windowed --name Everything \
+            --osx-bundle-identifier com.everythingmac.app \
+            --collect-submodules watchdog \
+            everything_mac.py
+          PLIST=dist/Everything.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSRemovableVolumesUsageDescription string Harici diskleri indekslemek icin erisim gerekir." "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :NSDesktopFolderUsageDescription string Masaustu klasorunu indekslemek icin erisim gerekir." "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :NSDocumentsFolderUsageDescription string Belgeler klasorunu indekslemek icin erisim gerekir." "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :NSDownloadsFolderUsageDescription string Indirilenler klasorunu indekslemek icin erisim gerekir." "$PLIST" || true
+          codesign --force --deep --sign - dist/Everything.app
+
+      - name: DMG olustur
+        run: |
+          mkdir dmg
+          cp -R dist/Everything.app dmg/
+          ln -s /Applications dmg/Applications
+          for i in 1 2 3; do
+            hdiutil create -volname "Everything" -srcfolder dmg -ov -format UDZO "Everything-${{ matrix.name }}.dmg" && break
+            sleep 5
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Everything-${{ matrix.name }}
+          path: Everything-${{ matrix.name }}.dmg
