@@ -6,6 +6,7 @@ Everything (Mac) - dosya ve klasörleri anında bulun.
 voidtools Everything'in Mac için, sıfırdan yazılmış işlevsel bir benzeri.
 Yalnızca Python standart kütüphanesini kullanır (tkinter + sqlite3).
 İsteğe bağlı: `pip3 install watchdog` -> gerçek zamanlı güncelleme (FSEvents).
+Harici diskler takıldığında otomatik eklenir, çıkarıldığında kayıtları saklanır.
 
 Çalıştırma:   python3 everything_mac.py
 
@@ -18,6 +19,8 @@ Arama sözdizimi (Everything'e benzer):
   ext:mp4;mov         uzantıya göre
   size:>100mb         boyuta göre (>, <, >=, <=, =; kb mb gb tb)
   folder:  file:      yalnızca klasörler / yalnızca dosyalar
+  dm:today            değiştirilme tarihi (today, yesterday, thisweek, thismonth,
+                      thisyear, 2024, 2024-05, 2024-05-17, >2024-01-01, 2023..2024)
   path:belgeler       yolda ara
   Documents/rapor     "/" içeren terimler yolda aranır
   regex:^IMG_\\d+     düzenli ifade (veya "Regex" kutusu)
@@ -34,7 +37,7 @@ import threading
 import time
 import unicodedata
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 
 try:
@@ -44,13 +47,20 @@ except ImportError:  # Homebrew Python'da: brew install python-tk
     tk = None
 
 APP_NAME = "EverythingMac"
-SCHEMA_VERSION = 1
+APP_VERSION = "1.2"
+SCHEMA_VERSION = 2
 RESULT_LIMIT = 2000          # ekranda gösterilecek en fazla satır
 POLL_SECONDS = 60            # watchdog yoksa periyodik tarama aralığı
 BATCH_ROWS = 5000            # bu kadar satırda bir commit (sonuçlar canlı görünsün)
 
 SKIP_NAMES = {".Spotlight-V100", ".fseventsd", ".Trashes",
-              ".DocumentRevisions-V100", ".TemporaryItems", ".vol"}
+              ".DocumentRevisions-V100", ".TemporaryItems", ".vol",
+              "$RECYCLE.BIN", "System Volume Information", ".DS_Store", ".localized"}
+# macOS'ta Finder'ın tek dosya gibi gösterdiği paketler (içleri varsayılan olarak indekslenmez)
+PACKAGE_EXTS = (".app", ".photoslibrary", ".imovielibrary", ".fcpbundle", ".tvlibrary",
+                ".musiclibrary", ".bundle", ".framework", ".plugin", ".kext", ".xcodeproj")
+VOLUMES_DIR = "/Volumes"
+_ismount = os.path.ismount
 SKIP_PATHS = {"/System/Volumes", "/dev", "/private/var/vm", "/proc"}
 
 
@@ -102,7 +112,9 @@ def fmt_date(ts):
 
 def default_config():
     home = os.path.expanduser("~")
-    return {"roots": [home], "excludes": [os.path.join(home, "Library")]}
+    return {"roots": [home], "excludes": [os.path.join(home, "Library")],
+            "auto_external": True, "ignored_volumes": [],
+            "skip_packages": True, "fda_warned": False}
 
 
 def load_config(folder):
@@ -115,6 +127,13 @@ def load_config(folder):
             cfg["roots"] = [str(x) for x in data["roots"]]
         if isinstance(data.get("excludes"), list):
             cfg["excludes"] = [str(x) for x in data["excludes"]]
+        if isinstance(data.get("auto_external"), bool):
+            cfg["auto_external"] = data["auto_external"]
+        for key in ("skip_packages", "fda_warned"):
+            if isinstance(data.get(key), bool):
+                cfg[key] = data[key]
+        if isinstance(data.get("ignored_volumes"), list):
+            cfg["ignored_volumes"] = [str(x) for x in data["ignored_volumes"]]
     except (OSError, ValueError):
         pass
     return cfg
@@ -137,11 +156,66 @@ def open_path(path):
         subprocess.Popen(["xdg-open", path])
 
 
+def open_privacy_settings():
+    """Sistem Ayarları > Gizlilik ve Güvenlik > Tam Disk Erişimi"""
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "x-apple.systempreferences:"
+                          "com.apple.preference.security?Privacy_AllFiles"])
+
+
 def reveal_path(path):
     if sys.platform == "darwin":
         subprocess.Popen(["open", "-R", path])
     else:
         open_path(os.path.dirname(path))
+
+
+def volume_mount_of(path):
+    """/Volumes/<disk>/... -> /Volumes/<disk>; harici disk yolu değilse None."""
+    prefix = VOLUMES_DIR.rstrip(os.sep) + os.sep
+    if path.startswith(prefix):
+        first = path[len(prefix):].split(os.sep)[0]
+        if first:
+            return prefix + first
+    return None
+
+
+def mount_online(path):
+    """Yol harici bir diskteyse o disk takılı mı? (diğer yollar için her zaman True)"""
+    mount = volume_mount_of(path)
+    return True if mount is None else bool(_ismount(mount))
+
+
+def root_online(root):
+    return mount_online(root) and os.path.isdir(root)
+
+
+def _boot_devs():
+    devs = set()
+    for p in ("/", os.path.expanduser("~")):
+        try:
+            devs.add(os.stat(p).st_dev)
+        except OSError:
+            pass
+    return devs
+
+
+def list_external_volumes():
+    """/Volumes altındaki, sistem diski olmayan takılı diskler."""
+    try:
+        names = sorted(os.listdir(VOLUMES_DIR))
+    except OSError:
+        return []
+    boot = _boot_devs()
+    out = []
+    for n in names:
+        p = os.path.join(VOLUMES_DIR, n)
+        try:
+            if _ismount(p) and os.stat(p).st_dev not in boot:
+                out.append(p)
+        except OSError:
+            pass
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -165,6 +239,7 @@ CREATE TABLE IF NOT EXISTS files(
     mtime  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS files_dir ON files(dir_id);
+CREATE INDEX IF NOT EXISTS files_lname ON files(lname);
 """
 
 
@@ -204,8 +279,11 @@ def open_db(path):
 class Indexer(threading.Thread):
     """Klasörleri tarar, SQLite'a yazar ve değişiklikleri izler."""
 
-    def __init__(self, db_path, data_folder, roots, excludes):
+    def __init__(self, db_path, data_folder, roots, excludes, skip_packages=True):
         super().__init__(daemon=True)
+        self.skip_packages = skip_packages
+        self.force_next = False
+        self.denied = set()
         self.conn = open_db(db_path)
         self.data_folder = os.path.abspath(data_folder)
         self.stop_evt = threading.Event()
@@ -231,9 +309,12 @@ class Indexer(threading.Thread):
         self.excludes.append(self.data_folder)
         self.excludes.extend(SKIP_PATHS)
 
-    def set_config(self, roots, excludes):
+    def set_config(self, roots, excludes, skip_packages=None):
         with self.lock:
             self._set_paths(roots, excludes)
+            if skip_packages is not None and skip_packages != self.skip_packages:
+                self.skip_packages = skip_packages
+                self.force_next = True           # ayar değişti: her şeyi yeniden listele
             self.reconfigure = True
         self.wake.set()
 
@@ -252,7 +333,11 @@ class Indexer(threading.Thread):
     def status(self):
         if self.scanning:
             return f"İndeksleniyor… {fmt_int(self.scanned)} klasör tarandı"
-        return f"Hazır · {fmt_int(self.count)} öğe · izleme: {self.watch_mode}"
+        off = sum(1 for r in self.roots if not root_online(r))
+        extra = f" · {off} konum çevrimdışı" if off else ""
+        if self.denied:
+            extra += f" · ⚠ {fmt_int(len(self.denied))} klasöre erişilemedi"
+        return f"Hazır · {fmt_int(self.count)} öğe · izleme: {self.watch_mode}{extra}"
 
     def _excluded(self, path):
         for e in self.excludes:
@@ -278,11 +363,18 @@ class Indexer(threading.Thread):
                         continue
                     try:
                         is_dir = e.is_dir(follow_symlinks=False)
+                        pkg = False
+                        if is_dir and self.skip_packages and name.lower().endswith(PACKAGE_EXTS):
+                            is_dir, pkg = False, True        # tek dosya gibi davran, içine girme
                         st = e.stat(follow_symlinks=False)
                         out.append((name, fold(name), 1 if is_dir else 0,
-                                    0 if is_dir else st.st_size, st.st_mtime))
+                                    0 if (is_dir or pkg) else st.st_size, st.st_mtime))
                     except OSError:
                         out.append((name, fold(name), 0, 0, 0.0))
+        except PermissionError:
+            if len(self.denied) < 5000:
+                self.denied.add(d)
+            return None
         except OSError:
             return None
         out.sort(key=lambda t: t[1])
@@ -334,7 +426,8 @@ class Indexer(threading.Thread):
                 try:
                     st = os.stat(d)
                 except OSError:
-                    self._remove_entry(d)
+                    if mount_online(d):      # disk çıkarıldıysa kayıtlar saklanır
+                        self._remove_entry(d)
                     continue
                 row = self.conn.execute("SELECT id, mtime FROM dirs WHERE path=?", (d,)).fetchone()
                 self.scanned += 1
@@ -381,12 +474,13 @@ class Indexer(threading.Thread):
     def full_pass(self, force=False):
         self.scanning = True
         self.scanned = 0
+        self.denied = set()
         try:
             self._prune()
             for r in list(self.roots):
                 if self.stop_evt.is_set():
                     break
-                if os.path.isdir(r):
+                if root_online(r):
                     self.index_tree(r, force_all=force)
         finally:
             self._refresh_count()
@@ -438,7 +532,7 @@ class Indexer(threading.Thread):
         try:
             obs = Observer()
             for r in self.roots:
-                if os.path.isdir(r):
+                if root_online(r):
                     obs.schedule(Handler(), r, recursive=True)
             obs.daemon = True
             obs.start()
@@ -457,9 +551,10 @@ class Indexer(threading.Thread):
                 with self.lock:
                     reconf, self.reconfigure = self.reconfigure, False
                     full, self.full_rescan = self.full_rescan, False
+                    force_pk, self.force_next = self.force_next, False
                     dirty, self.dirty = self.dirty, set()
                 if reconf or full:
-                    self.full_pass(force=full)
+                    self.full_pass(force=full or force_pk)
                     if reconf:
                         self._start_watcher()
                     last_poll = time.time()
@@ -470,7 +565,8 @@ class Indexer(threading.Thread):
                         for d in sorted(dirty):
                             if self.stop_evt.is_set():
                                 break
-                            if self._under_roots(d) and not self._excluded(d):
+                            if (self._under_roots(d) and not self._excluded(d)
+                                    and mount_online(d)):
                                 self.index_tree(d, force_first=True)
                     finally:
                         self._refresh_count()
@@ -494,7 +590,100 @@ class QueryError(Exception):
     pass
 
 
-Req = namedtuple("Req", "gen text match_case match_path regex sort_col sort_desc refresh")
+Req = namedtuple("Req", "gen text match_case match_path regex sort_col sort_desc refresh filter_name",
+                 defaults=("Hepsi",))
+
+FILTERS = {
+    "Hepsi": None,
+    "Ses": ("ext", "aac aif aiff alac ape flac m4a mp3 ogg opus wav wma"),
+    "Sıkıştırılmış": ("ext", "7z bz2 dmg gz iso rar tar tgz xz zip"),
+    "Belge": ("ext", "csv doc docx epub key md numbers odt pages pdf ppt pptx rtf txt xls xlsx"),
+    "Uygulama": ("app", "pkg command sh"),
+    "Klasör": ("dir", ""),
+    "Resim": ("ext", "ai arw bmp cr2 gif heic jpeg jpg nef png psd raw svg tif tiff webp"),
+    "Video": ("ext", "avi flv m4v mkv mov mp4 mpeg mpg webm wmv"),
+}
+
+
+def filter_cond(name):
+    spec = FILTERS.get(name)
+    if not spec:
+        return None, []
+    kind, exts = spec
+    if kind == "dir":
+        return "f.is_dir = 1", []
+    patterns = ["*." + e for e in exts.split()]
+    file_cond = "f.is_dir = 0 AND (" + " OR ".join("f.lname GLOB ?" for _ in patterns) + ")"
+    if kind == "app":                      # .app paketleri macOS'ta klasördür
+        return f"(f.lname GLOB ? OR ({file_cond}))", ["*.app"] + patterns
+    return file_cond, patterns
+
+
+def _add_months(d, n):
+    y, m = divmod(d.month - 1 + n, 12)
+    return d.replace(year=d.year + y, month=m + 1, day=1)
+
+
+def _period(lit):
+    """today / 2024 / 2024-05 / 2024-05-17 / 17.05.2024 -> (başlangıç_ts, bitiş_ts)"""
+    lit = lit.strip().lower()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    day = timedelta(days=1)
+    if lit == "today":
+        s, e = today, today + day
+    elif lit == "yesterday":
+        s, e = today - day, today
+    elif lit in ("thisweek", "lastweek"):
+        s = today - timedelta(days=today.weekday())
+        if lit == "lastweek":
+            s -= timedelta(days=7)
+        e = s + timedelta(days=7)
+    elif lit in ("thismonth", "lastmonth"):
+        s = _add_months(today.replace(day=1), 0 if lit == "thismonth" else -1)
+        e = _add_months(s, 1)
+    elif lit in ("thisyear", "lastyear"):
+        y = today.year - (1 if lit == "lastyear" else 0)
+        s, e = datetime(y, 1, 1), datetime(y + 1, 1, 1)
+    else:
+        m = re.match(r"^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?$", lit)
+        if m:
+            y = int(m.group(1))
+            if m.group(3):
+                s = datetime(y, int(m.group(2)), int(m.group(3)))
+                e = s + day
+            elif m.group(2):
+                s = datetime(y, int(m.group(2)), 1)
+                e = _add_months(s, 1)
+            else:
+                s, e = datetime(y, 1, 1), datetime(y + 1, 1, 1)
+        else:
+            m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", lit)
+            if not m:
+                raise ValueError(lit)
+            s = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            e = s + day
+    return s.timestamp(), e.timestamp()
+
+
+def _dm_cond(spec):
+    m = re.match(r"^(>=|<=|>|<|=)?(.*)$", spec.strip())
+    op, val = m.group(1) or "=", m.group(2).strip()
+    try:
+        if ".." in val:
+            a, b = val.split("..", 1)
+            return "f.mtime >= ? AND f.mtime < ?", [_period(a)[0], _period(b)[1]]
+        start, end = _period(val)
+    except ValueError:
+        raise QueryError("dm: örnekler -> dm:today  dm:2024  dm:>2024-05-01  dm:2023..2024")
+    if op == "=":
+        return "f.mtime >= ? AND f.mtime < ?", [start, end]
+    if op == ">":
+        return "f.mtime >= ?", [end]
+    if op == ">=":
+        return "f.mtime >= ?", [start]
+    if op == "<":
+        return "f.mtime < ?", [start]
+    return "f.mtime < ?", [end]                        # <=
 Compiled = namedtuple("Compiled", "select count params")
 
 SIZE_RE = re.compile(r"^(>=|<=|>|<|=)?\s*([0-9]+(?:[.,][0-9]+)?)\s*([a-zA-Z]*)$")
@@ -568,6 +757,8 @@ def build_where(text, match_case=False, match_path=False, regex=False):
             value = float(sm.group(2).replace(",", ".")) * UNITS[sm.group(3).lower()]
             c = f"f.is_dir = 0 AND f.size {op} ?"
             p = [int(value)]
+        elif not quoted and low.startswith("dm:"):
+            c, p = _dm_cond(tok[3:])
         else:
             if not quoted and low.startswith("path:") and len(tok) > 5:
                 tok, force_path = tok[5:], True
@@ -595,6 +786,10 @@ def compile_query(req):
     order = ""
     if req.sort_col in SORTS:
         order = " ORDER BY " + SORTS[req.sort_col].format(d="DESC" if req.sort_desc else "ASC")
+    fc, fp = filter_cond(req.filter_name)
+    if fc:
+        where = f"({where}) AND ({fc})"
+        params = params + fp
     select = ("SELECT f.name, d.path, f.is_dir, f.size, f.mtime "
               "FROM files f CROSS JOIN dirs d ON d.id = f.dir_id "
               f"WHERE {where}{order} LIMIT {RESULT_LIMIT}")
@@ -685,16 +880,19 @@ class App:
         self.db_path = os.path.join(self.folder, "index.db")
         self.cfg = load_config(self.folder)
 
-        self.indexer = Indexer(self.db_path, self.folder, self.cfg["roots"], self.cfg["excludes"])
+        self.indexer = Indexer(self.db_path, self.folder, self.cfg["roots"], self.cfg["excludes"],
+                               self.cfg["skip_packages"])
         self.out = queue.Queue()
         self.searcher = Searcher(self.db_path, self.out)
 
         self.gen = 0
         self.rows = []
         self.total = None
-        self.sort_col = None
+        self.sort_col = "name"           # Everything gibi varsayılan: ada göre
         self.sort_desc = False
         self.seen_version = -1
+        self._vol_check = 0.0
+        self._vol_state = None
         self.last_refresh = 0.0
         self.search_job = None
 
@@ -707,7 +905,7 @@ class App:
     # ---- arayüz kurulumu -------------------------------------------------
     def _build_ui(self):
         self.root = root = tk.Tk()
-        root.title("Everything")
+        root.title(f"Everything {APP_VERSION}")
         root.geometry("1100x650")
         root.minsize(700, 400)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -721,6 +919,7 @@ class App:
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label="Klasör ayarları…", command=self.open_settings)
         filemenu.add_command(label="Tam yeniden tara", command=self.indexer.rescan_full)
+        filemenu.add_command(label="Tam Disk Erişimi ayarlarını aç…", command=open_privacy_settings)
         filemenu.add_separator()
         filemenu.add_command(label="Çıkış", command=self.on_close)
         menubar.add_cascade(label="Dosya", menu=filemenu)
@@ -743,6 +942,13 @@ class App:
                           ("Düzenli ifade (regex)", self.var_regex)):
             ttk.Checkbutton(opts, text=text, variable=var,
                             command=self.schedule_search).pack(side="left", padx=(0, 14))
+
+        self.var_filter = tk.StringVar(value="Hepsi")
+        combo = ttk.Combobox(opts, textvariable=self.var_filter, values=list(FILTERS),
+                             state="readonly", width=14)
+        combo.pack(side="right")
+        ttk.Label(opts, text="Filtre:").pack(side="right", padx=(0, 6))
+        combo.bind("<<ComboboxSelected>>", lambda e: self.schedule_search())
 
         body = ttk.Frame(root)
         body.pack(fill="both", expand=True, padx=8, pady=4)
@@ -789,6 +995,7 @@ class App:
         bind(root, "<Command-f>", self.focus_entry)
         bind(root, "<Control-f>", self.focus_entry)
         self.entry.focus_set()
+        self.update_headings()
 
     # ---- arama ------------------------------------------------------------
     def schedule_search(self):
@@ -801,17 +1008,20 @@ class App:
         self.gen += 1
         self.searcher.submit(Req(self.gen, self.query.get(), self.var_case.get(),
                                  self.var_path.get(), self.var_regex.get(),
-                                 self.sort_col, self.sort_desc, refresh))
+                                 self.sort_col, self.sort_desc, refresh, self.var_filter.get()))
 
     def sort_by(self, col):
         if self.sort_col == col:
             self.sort_desc = not self.sort_desc
         else:
             self.sort_col, self.sort_desc = col, False
+        self.update_headings()
+        self.run_search()
+
+    def update_headings(self):
         for c in self.COLS:
             mark = (" ▼" if self.sort_desc else " ▲") if c == self.sort_col else ""
             self.tree.heading(c, text=self.HEAD[c] + mark)
-        self.run_search()
 
     def poll(self):
         try:
@@ -819,6 +1029,8 @@ class App:
                 self.handle_result(*self.out.get_nowait())
         except queue.Empty:
             pass
+        self.check_volumes()
+        self.check_access()
         v = self.indexer.version
         if v != self.seen_version and time.time() - self.last_refresh > 1.0:
             self.seen_version = v
@@ -826,6 +1038,47 @@ class App:
             self.run_search(refresh=True)
         self.lbl_right.config(text=self.indexer.status)
         self.root.after(100, self.poll)
+
+    def check_access(self):
+        """Masaüstü/Belgeler/İndirilenler okunamıyorsa Tam Disk Erişimi için bir kez uyar."""
+        if self.cfg.get("fda_warned") or self.indexer.scanning or not self.indexer.denied:
+            return
+        home = os.path.expanduser("~")
+        protected = {os.path.join(home, n) for n in ("Desktop", "Documents", "Downloads")}
+        if not (protected & self.indexer.denied):
+            return
+        self.cfg["fda_warned"] = True
+        save_config(self.folder, self.cfg)
+        if messagebox.askyesno(
+                "Erişim izni gerekli",
+                "Everything bazı klasörlere (Masaüstü, Belgeler, İndirilenler…) erişemiyor, "
+                "bu yüzden bu klasörlerdeki dosyalar aramada çıkmaz.\n\n"
+                "Çözmek için Sistem Ayarları > Gizlilik ve Güvenlik > Tam Disk Erişimi "
+                "bölümünde Everything'i açman gerekir. Açtıktan sonra Everything'i kapatıp "
+                "yeniden başlat.\n\nAyarları şimdi açayım mı?"):
+            open_privacy_settings()
+
+    def check_volumes(self):
+        """Harici disk takılınca otomatik ekler; çıkarılıp tekrar takılınca yeniden tarar."""
+        now = time.time()
+        if now - self._vol_check < 3.0:
+            return
+        self._vol_check = now
+        changed = False
+        if self.cfg.get("auto_external", True):
+            for p in list_external_volumes():
+                if p not in self.cfg["roots"] and p not in self.cfg["ignored_volumes"]:
+                    self.cfg["roots"].append(p)
+                    changed = True
+        state = {r: root_online(r) for r in self.cfg["roots"] if volume_mount_of(r)}
+        if self._vol_state is not None:
+            for r, online in state.items():
+                if online and not self._vol_state.get(r, False):
+                    changed = True                       # disk yeniden takıldı
+        self._vol_state = state
+        if changed:
+            save_config(self.folder, self.cfg)
+            self.indexer.set_config(self.cfg["roots"], self.cfg["excludes"])
 
     def handle_result(self, req, rows, total, err):
         if req.gen != self.gen:
@@ -935,7 +1188,7 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("Klasör ayarları")
         win.transient(self.root)
-        win.geometry("560x430")
+        win.geometry("560x510")
         box = ttk.Frame(win, padding=10)
         box.pack(fill="both", expand=True)
 
@@ -964,12 +1217,28 @@ class App:
 
         lb_roots = make_list("İndekslenecek klasörler", self.cfg["roots"])
         lb_excl = make_list("Hariç tutulacak klasörler", self.cfg["excludes"])
+        var_auto = tk.BooleanVar(value=self.cfg.get("auto_external", True))
+        ttk.Checkbutton(box, text="Takılan harici diskleri otomatik ekle",
+                        variable=var_auto).pack(anchor="w", pady=(4, 0))
+        var_pkg = tk.BooleanVar(value=self.cfg.get("skip_packages", True))
+        ttk.Checkbutton(box, text="Paket içeriklerini (.app, .photoslibrary…) indeksleme",
+                        variable=var_pkg).pack(anchor="w")
 
         def apply():
-            self.cfg["roots"] = list(lb_roots.get(0, "end"))
+            old, new = set(self.cfg["roots"]), list(lb_roots.get(0, "end"))
+            ignored = set(self.cfg.get("ignored_volumes", []))
+            for r in old - set(new):          # elle kaldırılan disk tekrar otomatik eklenmesin
+                if volume_mount_of(r):
+                    ignored.add(r)
+            ignored -= set(new)
+            self.cfg["ignored_volumes"] = sorted(ignored)
+            self.cfg["auto_external"] = bool(var_auto.get())
+            self.cfg["skip_packages"] = bool(var_pkg.get())
+            self.cfg["roots"] = new
             self.cfg["excludes"] = list(lb_excl.get(0, "end"))
             save_config(self.folder, self.cfg)
-            self.indexer.set_config(self.cfg["roots"], self.cfg["excludes"])
+            self.indexer.set_config(self.cfg["roots"], self.cfg["excludes"],
+                                    self.cfg["skip_packages"])
             win.destroy()
 
         row = ttk.Frame(box)
